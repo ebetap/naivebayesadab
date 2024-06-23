@@ -2,26 +2,24 @@ import fs from 'fs';
 import _ from 'lodash';
 import natural from 'natural';
 import { TfIdf } from 'natural';
+import { createRequire } from 'module';
+import { Worker, isMainThread, parentPort } from 'worker_threads';
+import D3Node from 'd3-node';
 
-const defaultStopWords = new Set(natural.stopwords);
-const stemmer = natural.PorterStemmer;
-const lemmatizer = new natural.WordNetLemmatizer();
+const { WordTokenizer, PorterStemmer, WordNetLemmatizer, stopwords } = natural;
 
 class NaiveBayesClassifier {
-  constructor(stopWords = defaultStopWords, n = 1) {
-    this.categories = {};
+  constructor(stopWords = new Set(stopwords.words), n = 1) {
+    this.categories = new Map();
     this.vocab = new Set();
     this.stopWords = stopWords;
     this.n = n; // For n-grams
   }
 
   preprocess(text) {
-    const words = text
-      .toLowerCase()
-      .replace(/[^\w\s]/g, '')
-      .split(/\s+/)
-      .filter(word => !this.stopWords.has(word))
-      .map(word => lemmatizer.lemmatize(stemmer.stem(word)));
+    const words = WordTokenizer.tokenize(text.toLowerCase())
+      .filter(word => !this.stopWords.has(word) && /\w/.test(word))
+      .map(word => WordNetLemmatizer.lemmatize(PorterStemmer.stem(word)));
 
     if (this.n > 1) {
       return _.flatMap(words, (word, i) => {
@@ -37,16 +35,17 @@ class NaiveBayesClassifier {
 
   train(text, category) {
     const words = this.preprocess(text);
-    if (!this.categories[category]) {
-      this.categories[category] = { total: 0, wordCount: {}, tfidf: new TfIdf() };
+    if (!this.categories.has(category)) {
+      this.categories.set(category, { total: 0, wordCount: new Map(), tfidf: new TfIdf() });
     }
 
-    this.categories[category].tfidf.addDocument(words.join(' '));
+    this.categories.get(category).tfidf.addDocument(words.join(' '));
 
     words.forEach(word => {
-      this.categories[category].wordCount[word] = (this.categories[category].wordCount[word] || 0) + 1;
+      const categoryInfo = this.categories.get(category);
+      categoryInfo.wordCount.set(word, (categoryInfo.wordCount.get(word) || 0) + 1);
       this.vocab.add(word);
-      this.categories[category].total++;
+      categoryInfo.total++;
     });
   }
 
@@ -54,12 +53,12 @@ class NaiveBayesClassifier {
     const words = this.preprocess(text);
     const scores = {};
 
-    Object.keys(this.categories).forEach(category => {
-      scores[category] = Math.log((this.categories[category].total + 1) / (this.totalExamples() + Object.keys(this.categories).length));
+    this.categories.forEach((categoryInfo, category) => {
+      scores[category] = Math.log((categoryInfo.total + 1) / (this.totalExamples() + this.categories.size));
 
       words.forEach(word => {
-        const wordCount = this.categories[category].wordCount[word] || 0;
-        scores[category] += Math.log((wordCount + 1) / (this.categories[category].total + this.vocab.size));
+        const wordCount = categoryInfo.wordCount.get(word) || 0;
+        scores[category] += Math.log((wordCount + 1) / (categoryInfo.total + this.vocab.size));
       });
     });
 
@@ -67,13 +66,13 @@ class NaiveBayesClassifier {
   }
 
   totalExamples() {
-    return Object.values(this.categories).reduce((total, category) => total + category.total, 0);
+    return Array.from(this.categories.values()).reduce((total, category) => total + category.total, 0);
   }
 
   saveModel(filepath) {
     try {
       const modelData = {
-        categories: this.categories,
+        categories: Array.from(this.categories),
         vocab: Array.from(this.vocab)
       };
       fs.writeFileSync(filepath, JSON.stringify(modelData));
@@ -85,7 +84,7 @@ class NaiveBayesClassifier {
   loadModel(filepath) {
     try {
       const modelData = JSON.parse(fs.readFileSync(filepath, 'utf8'));
-      this.categories = modelData.categories;
+      this.categories = new Map(modelData.categories);
       this.vocab = new Set(modelData.vocab);
     } catch (error) {
       console.error('Error loading model:', error);
@@ -105,25 +104,25 @@ class NaiveBayesClassifier {
 
   precisionRecallF1(testData) {
     const results = { TP: 0, FP: 0, FN: 0 };
-    const categoryCounts = {};
+    const categoryCounts = new Map();
 
     testData.forEach(([text, trueCategory]) => {
       const predictedCategory = this.classify(text);
-      if (!categoryCounts[trueCategory]) {
-        categoryCounts[trueCategory] = { TP: 0, FP: 0, FN: 0 };
+      if (!categoryCounts.has(trueCategory)) {
+        categoryCounts.set(trueCategory, { TP: 0, FP: 0, FN: 0 });
       }
       if (predictedCategory === trueCategory) {
-        categoryCounts[trueCategory].TP++;
+        categoryCounts.get(trueCategory).TP++;
       } else {
-        categoryCounts[trueCategory].FN++;
-        if (!categoryCounts[predictedCategory]) {
-          categoryCounts[predictedCategory] = { TP: 0, FP: 0, FN: 0 };
+        categoryCounts.get(trueCategory).FN++;
+        if (!categoryCounts.has(predictedCategory)) {
+          categoryCounts.set(predictedCategory, { TP: 0, FP: 0, FN: 0 });
         }
-        categoryCounts[predictedCategory].FP++;
+        categoryCounts.get(predictedCategory).FP++;
       }
     });
 
-    Object.values(categoryCounts).forEach(counts => {
+    categoryCounts.forEach(counts => {
       results.TP += counts.TP;
       results.FP += counts.FP;
       results.FN += counts.FN;
@@ -136,18 +135,28 @@ class NaiveBayesClassifier {
     return { precision, recall, f1 };
   }
 
+  stratifyFolds(data, k) {
+    const folds = Array.from({ length: k }, () => []);
+    const categories = _.groupBy(data, ([, category]) => category);
+
+    Object.values(categories).forEach(categoryData => {
+      categoryData.forEach((item, index) => {
+        folds[index % k].push(item);
+      });
+    });
+
+    return folds;
+  }
+
   crossValidate(data, k = 5) {
-    const foldSize = Math.floor(data.length / k);
+    const stratifiedFolds = this.stratifyFolds(data, k);
     const accuracyResults = [];
 
     for (let i = 0; i < k; i++) {
-      const validationStart = i * foldSize;
-      const validationEnd = validationStart + foldSize;
-      const validationSet = data.slice(validationStart, validationEnd);
-      const trainingSet = [
-        ...data.slice(0, validationStart),
-        ...data.slice(validationEnd)
-      ];
+      const validationSet = stratifiedFolds[i];
+      const trainingSet = stratifiedFolds
+        .filter((_, index) => index !== i)
+        .flat();
 
       const classifier = new NaiveBayesClassifier(this.stopWords, this.n);
       trainingSet.forEach(([text, category]) => classifier.train(text, category));
@@ -160,13 +169,77 @@ class NaiveBayesClassifier {
   }
 
   visualizeImportantWords() {
-    Object.keys(this.categories).forEach(category => {
+    const d3n = new D3Node();
+    const d3 = d3n.d3;
+
+    this.categories.forEach((categoryInfo, category) => {
       console.log(`Important words for category: ${category}`);
-      this.categories[category].tfidf.tfidfs((i, measure, key) => {
-        console.log(`${key}: ${measure}`);
+      const words = [];
+      categoryInfo.tfidf.tfidfs((i, measure, key) => {
+        words.push({ word: key, score: measure });
       });
+
+      // Sort words by TF-IDF score
+      words.sort((a, b) => b.score - a.score);
+
+      // Take top 10 words for visualization
+      const topWords = words.slice(0, 10);
+
+      // Create bar chart
+      const svg = d3n.createSVG(600, 400);
+      const margin = { top: 20, right: 20, bottom: 30, left: 40 };
+      const width = +svg.attr('width') - margin.left - margin.right;
+      const height = +svg.attr('height') - margin.top - margin.bottom;
+      const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+      const x = d3.scaleBand()
+        .rangeRound([0, width])
+        .padding(0.1)
+        .domain(topWords.map(d => d.word));
+
+      const y = d3.scaleLinear()
+        .rangeRound([height, 0])
+        .domain([0, d3.max(topWords, d => d.score)]);
+
+      g.append('g')
+        .attr('class', 'axis axis--x')
+        .attr('transform', `translate(0,${height})`)
+        .call(d3.axisBottom(x));
+
+      g.append('g')
+        .attr('class', 'axis axis--y')
+        .call(d3.axisLeft(y).ticks(10));
+
+      g.selectAll('.bar')
+        .data(topWords)
+        .enter().append('rect')
+        .attr('class', 'bar')
+        .attr('x', d => x(d.word))
+        .attr('y', d => y(d.score))
+        .attr('width', x.bandwidth())
+        .attr('height', d => height - y(d.score));
+
+      console.log(d3n.svgString());
     });
   }
+}
+
+// Utility function for parallel processing
+function runInWorker(data, callback) {
+  const worker = new Worker(__filename);
+  worker.postMessage(data);
+  worker.on('message', callback);
+  worker.on('error', err => console.error('Worker error:', err));
+}
+
+if (!isMainThread) {
+  parentPort.on('message', data => {
+    const { trainingSet, text } = data;
+    const classifier = new NaiveBayesClassifier();
+    trainingSet.forEach(([text, category]) => classifier.train(text, category));
+    const result = classifier.classify(text);
+    parentPort.postMessage(result);
+  });
 }
 
 export default NaiveBayesClassifier;

@@ -1,5 +1,5 @@
 {
-  "name": "naive-bayes-classifier",
+  "name": "naivebayesadab",
   "version": "1.0.0",
   "description": "A Naive Bayes text classifier implementation in JavaScript",
   "main": "index.js",

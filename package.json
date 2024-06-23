@@ -1,1 +1,22 @@
-
+{
+  "name": "naive-bayes-classifier",
+  "version": "1.0.0",
+  "description": "A Naive Bayes text classifier implementation in JavaScript",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Beta 'Muhammad' Priyoko",
+  "license": "MIT",
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "natural": "^0.6.3",
+    "d3-node": "^3.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^16.11.17",
+    "@types/lodash": "^4.14.186",
+    "@types/natural": "^0.4.8"
+  }
+}
